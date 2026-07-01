@@ -1,0 +1,5 @@
+﻿node_modules/
+src-tauri/target/
+src-tauri/sidecar/venv/
+dist/
+.env
