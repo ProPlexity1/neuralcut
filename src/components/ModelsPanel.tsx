@@ -42,6 +42,7 @@ const TIER_COLORS: Record<string, { bg: string; text: string; border: string; gr
 };
 
 export default function ModelsPanel({ models, gpu, onDownload, onCancel, onDelete }: ModelsPanelProps) {
+  // Real disk usage: sum of downloaded model sizes
   const totalDownloaded = models.filter(m => m.downloaded).reduce((s, m) => s + m.size, 0);
   const totalAvailable = models.reduce((s, m) => s + m.size, 0);
 
@@ -64,12 +65,14 @@ export default function ModelsPanel({ models, gpu, onDownload, onCancel, onDelet
           <div className="flex-1">
             <div className="flex items-center justify-between mb-1.5">
               <span className="text-sm font-medium text-text-primary">Local Storage</span>
-              <span className="text-xs text-text-muted">{totalDownloaded.toFixed(1)} / {totalAvailable.toFixed(1)} GB</span>
+              <span className="text-xs text-text-muted">
+                {totalDownloaded.toFixed(1)} / {totalAvailable.toFixed(1)} GB
+              </span>
             </div>
             <div className="h-2 rounded-full bg-bg-primary overflow-hidden">
               <div
                 className="h-full rounded-full bg-gradient-to-r from-accent-blue to-accent-purple transition-all duration-500"
-                style={{ width: `${(totalDownloaded / totalAvailable) * 100}%` }}
+                style={{ width: totalAvailable > 0 ? `${(totalDownloaded / totalAvailable) * 100}%` : '0%' }}
               />
             </div>
           </div>
@@ -82,7 +85,11 @@ export default function ModelsPanel({ models, gpu, onDownload, onCancel, onDelet
             <p className="text-sm text-text-secondary">
               Your <span className="text-text-primary font-medium">{gpu.name}</span> with{' '}
               <span className="text-text-primary font-medium">{gpu.vram}GB VRAM</span> supports models up to{' '}
-              <span className={cn('font-medium', gpu.vram >= 16 ? 'text-purple-400' : gpu.vram >= 12 ? 'text-blue-400' : gpu.vram >= 8 ? 'text-cyan-400' : 'text-green-400')}>
+              <span className={cn('font-medium',
+                gpu.vram >= 16 ? 'text-purple-400' :
+                gpu.vram >= 12 ? 'text-blue-400' :
+                gpu.vram >= 8 ? 'text-cyan-400' : 'text-green-400'
+              )}>
                 {gpu.vram >= 16 ? 'Ultra' : gpu.vram >= 12 ? 'Pro' : gpu.vram >= 8 ? 'Standard' : 'Lite'}
               </span> tier.
             </p>
@@ -94,10 +101,16 @@ export default function ModelsPanel({ models, gpu, onDownload, onCancel, onDelet
           {models.map((model, i) => {
             const colors = TIER_COLORS[model.tier];
             const compatible = gpu ? gpu.vram >= model.minVram : false;
-            const downloadSpeed = 45 + Math.random() * 30; // MB/s
-            const etaMinutes = model.downloading
-              ? Math.round((model.size * 1024 * (1 - model.downloadProgress / 100)) / downloadSpeed / 60)
-              : Math.round((model.size * 1024) / downloadSpeed / 60);
+
+            // Real speed and ETA from backend SSE data
+            const speedMbps = model.speedMbps ?? 0;
+            const etaSeconds = model.etaSeconds ?? 0;
+            const etaMinutes = Math.round(etaSeconds / 60);
+            const etaDisplay = etaSeconds > 60
+              ? `~${etaMinutes} min`
+              : etaSeconds > 0
+              ? `~${etaSeconds}s`
+              : '...';
 
             return (
               <motion.div
@@ -142,6 +155,7 @@ export default function ModelsPanel({ models, gpu, onDownload, onCancel, onDelet
                         <p className="mt-1 text-xs text-text-secondary max-w-lg">{model.description}</p>
                       </div>
                     </div>
+
                     <div className="flex items-center gap-2 flex-shrink-0 ml-4">
                       {model.downloaded ? (
                         <button
@@ -211,11 +225,11 @@ export default function ModelsPanel({ models, gpu, onDownload, onCancel, onDelet
                         <div className="flex items-center gap-3 text-text-muted">
                           <span className="flex items-center gap-1">
                             <Zap className="h-3 w-3" />
-                            {downloadSpeed.toFixed(0)} MB/s
+                            {speedMbps > 0 ? `${speedMbps.toFixed(1)} MB/s` : '...'}
                           </span>
                           <span className="flex items-center gap-1">
                             <Clock className="h-3 w-3" />
-                            ~{etaMinutes} min
+                            {etaSeconds > 0 ? etaDisplay : '...'}
                           </span>
                         </div>
                       </div>

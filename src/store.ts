@@ -2,21 +2,12 @@ import { useState, useCallback, useEffect } from 'react';
 import type { GPUInfo, ModelInfo, GenerationJob, AppView, SidecarStatus, LicenseInfo, GenerationStatus } from './types';
 import { invoke } from '@tauri-apps/api/core';
 
-// Simulated GPU data
-const SIMULATED_GPUS: GPUInfo[] = [
-  { name: 'NVIDIA GeForce RTX 4090', vram: 24, driver: '555.42.06', cudaVersion: '12.5', detected: true },
-  { name: 'NVIDIA GeForce RTX 4080', vram: 16, driver: '555.42.06', cudaVersion: '12.5', detected: true },
-  { name: 'NVIDIA GeForce RTX 4070', vram: 12, driver: '555.42.06', cudaVersion: '12.5', detected: true },
-  { name: 'NVIDIA GeForce RTX 3060', vram: 12, driver: '550.54.14', cudaVersion: '12.4', detected: true },
-];
-
-// Model definitions matching the VRAM table
 export const MODELS: ModelInfo[] = [
   {
     id: 'ltx-video-lite',
-    name: 'LTX-Video 0.9 Lite',
+    name: 'LTX-Video 0.9.1',
     tier: 'lite',
-    size: 2.1,
+    size: 5.72,
     minVram: 6,
     resolution: '512×320',
     fps: 8,
@@ -29,9 +20,9 @@ export const MODELS: ModelInfo[] = [
   },
   {
     id: 'ltx-video-standard',
-    name: 'LTX-Video 0.9',
+    name: 'LTX-Video 0.9.5',
     tier: 'standard',
-    size: 4.7,
+    size: 6.34,
     minVram: 8,
     resolution: '768×512',
     fps: 16,
@@ -44,48 +35,34 @@ export const MODELS: ModelInfo[] = [
   },
   {
     id: 'ltx-video-pro',
-    name: 'LTX-Video 0.9.1 Pro',
+    name: 'LTX-Video 13B FP8',
     tier: 'pro',
-    size: 7.2,
+    size: 15.7,
     minVram: 12,
     resolution: '1024×576',
     fps: 24,
     duration: '4-8s',
     huggingFaceRepo: 'Lightricks/LTX-Video',
-    description: 'High-quality generation with cinematic frame rates and longer duration.',
-    downloaded: true,
-    downloadProgress: 100,
+    description: 'High-quality 13B parameter model in FP8 precision. Requires 12GB+ VRAM.',
+    downloaded: false,
+    downloadProgress: 0,
     downloading: false,
   },
   {
     id: 'ltx-video-ultra',
-    name: 'LTX-Video 0.9.5 Ultra',
+    name: 'LTX-Video 13B Full',
     tier: 'ultra',
-    size: 10.3,
+    size: 28.6,
     minVram: 16,
     resolution: '1280×720',
     fps: 30,
     duration: '5-10s',
     huggingFaceRepo: 'Lightricks/LTX-Video',
-    description: 'Maximum quality with HD resolution, smooth motion, and extended duration.',
+    description: 'Maximum quality full precision 13B model. Requires 16GB+ VRAM.',
     downloaded: false,
     downloadProgress: 0,
     downloading: false,
   },
-];
-
-const SAMPLE_THUMBNAILS = [
-  '/images/sample-video-1.jpg',
-  '/images/sample-video-2.jpg',
-  '/images/sample-video-3.jpg',
-  '/images/sample-video-4.jpg',
-];
-
-const SAMPLE_PROMPTS = [
-  'A futuristic city skyline at sunset with flying vehicles and neon lights',
-  'An enchanted forest with bioluminescent mushrooms and fireflies',
-  'An astronaut floating in space near a colorful nebula',
-  'Ocean waves crashing on rocks at golden hour',
 ];
 
 let activeWs: WebSocket | null = null;
@@ -93,7 +70,8 @@ const activeEventSources: Record<string, EventSource> = {};
 
 const connectWebSocket = (
   setJobs: React.Dispatch<React.SetStateAction<GenerationJob[]>>,
-  setGalleryItems: React.Dispatch<React.SetStateAction<GenerationJob[]>>
+  setGalleryItems: React.Dispatch<React.SetStateAction<GenerationJob[]>>,
+  setModels: React.Dispatch<React.SetStateAction<ModelInfo[]>>
 ) => {
   if (activeWs) {
     if (activeWs.readyState === WebSocket.OPEN || activeWs.readyState === WebSocket.CONNECTING) {
@@ -112,6 +90,23 @@ const connectWebSocket = (
   ws.onmessage = (event) => {
     try {
       const msg = JSON.parse(event.data);
+
+      // Real-time download progress via WebSocket
+      if (msg.type === 'download_progress') {
+        const { model_id, progress, speed_mbps, eta_seconds, downloading, downloaded } = msg;
+        setModels(prev => prev.map(m =>
+          m.id === model_id ? {
+            ...m,
+            downloadProgress: progress,
+            speedMbps: speed_mbps,
+            etaSeconds: eta_seconds,
+            downloading,
+            downloaded,
+          } : m
+        ));
+      }
+
+      // Generation job status updates
       if (msg.type === 'job_status') {
         const { job_id, status, progress, eta, outputPath, error } = msg;
         setJobs(prev => prev.map(j => {
@@ -125,7 +120,6 @@ const connectWebSocket = (
               error: error || undefined,
               endTime: status === 'done' || status === 'error' ? Date.now() : j.endTime,
             };
-            
             if (status === 'done' && j.status !== 'done') {
               setGalleryItems(gal => {
                 if (gal.some(g => g.id === job_id)) return gal;
@@ -145,7 +139,7 @@ const connectWebSocket = (
   ws.onclose = () => {
     console.log('[NeuralCut] WebSocket closed, retrying in 3s...');
     activeWs = null;
-    setTimeout(() => connectWebSocket(setJobs, setGalleryItems), 3000);
+    setTimeout(() => connectWebSocket(setJobs, setGalleryItems, setModels), 3000);
   };
 
   ws.onerror = (err) => {
@@ -156,13 +150,13 @@ const connectWebSocket = (
 
 export function useAppStore() {
   const [view, setView] = useState<AppView>('setup');
-  const [setupStep, setSetupStep] = useState(0); // 0: splash, 1: detecting, 2: detected, 3: ready
+  const [setupStep, setSetupStep] = useState(0);
   const [gpu, setGpu] = useState<GPUInfo | null>(null);
   const [models, setModels] = useState<ModelInfo[]>(MODELS);
   const [jobs, setJobs] = useState<GenerationJob[]>([]);
   const [currentPrompt, setCurrentPrompt] = useState('');
   const [negativePrompt, setNegativePrompt] = useState('');
-  const [selectedModel, setSelectedModel] = useState('ltx-video-pro');
+  const [selectedModel, setSelectedModel] = useState('ltx-video-lite');
   const [sidecarStatus, setSidecarStatus] = useState<SidecarStatus>({
     running: false,
     port: 8188,
@@ -175,60 +169,7 @@ export function useAppStore() {
     tier: 'free',
     features: ['Basic generation', '512px max', 'Watermark'],
   });
-  const [galleryItems, setGalleryItems] = useState<GenerationJob[]>([
-    {
-      id: 'demo-1',
-      prompt: SAMPLE_PROMPTS[0],
-      negativePrompt: '',
-      model: 'ltx-video-pro',
-      status: 'done',
-      progress: 100,
-      eta: 0,
-      startTime: Date.now() - 120000,
-      endTime: Date.now() - 60000,
-      thumbnailUrl: SAMPLE_THUMBNAILS[0],
-      outputPath: '/output/video_001.mp4',
-    },
-    {
-      id: 'demo-2',
-      prompt: SAMPLE_PROMPTS[1],
-      negativePrompt: '',
-      model: 'ltx-video-pro',
-      status: 'done',
-      progress: 100,
-      eta: 0,
-      startTime: Date.now() - 240000,
-      endTime: Date.now() - 180000,
-      thumbnailUrl: SAMPLE_THUMBNAILS[1],
-      outputPath: '/output/video_002.mp4',
-    },
-    {
-      id: 'demo-3',
-      prompt: SAMPLE_PROMPTS[2],
-      negativePrompt: '',
-      model: 'ltx-video-standard',
-      status: 'done',
-      progress: 100,
-      eta: 0,
-      startTime: Date.now() - 360000,
-      endTime: Date.now() - 300000,
-      thumbnailUrl: SAMPLE_THUMBNAILS[2],
-      outputPath: '/output/video_003.mp4',
-    },
-    {
-      id: 'demo-4',
-      prompt: SAMPLE_PROMPTS[3],
-      negativePrompt: '',
-      model: 'ltx-video-standard',
-      status: 'done',
-      progress: 100,
-      eta: 0,
-      startTime: Date.now() - 480000,
-      endTime: Date.now() - 420000,
-      thumbnailUrl: SAMPLE_THUMBNAILS[3],
-      outputPath: '/output/video_004.mp4',
-    },
-  ]);
+  const [galleryItems, setGalleryItems] = useState<GenerationJob[]>([]);
 
   const detectGPU = useCallback(async () => {
     setSetupStep(1);
@@ -261,6 +202,8 @@ export function useAppStore() {
             downloaded: backendModel.downloaded,
             downloading: backendModel.downloading,
             downloadProgress: backendModel.progress,
+            speedMbps: backendModel.speed_mbps ?? 0,
+            etaSeconds: backendModel.eta_seconds ?? 0,
           };
         }
         return m;
@@ -273,20 +216,19 @@ export function useAppStore() {
   useEffect(() => {
     if (sidecarStatus.running && sidecarStatus.comfyuiReady) {
       fetchModels();
-      connectWebSocket(setJobs, setGalleryItems);
+      connectWebSocket(setJobs, setGalleryItems, setModels);
     }
   }, [sidecarStatus.running, sidecarStatus.comfyuiReady, fetchModels]);
 
   const startSidecar = useCallback(async () => {
     try {
-      const { invoke } = await import('@tauri-apps/api/core');
       const status = await invoke<{
         running: boolean;
         port: number;
         pid: number | null;
         message: string;
       }>('start_sidecar');
-      
+
       console.log('Sidecar invoke result:', JSON.stringify(status));
 
       if (status.running) {
@@ -303,7 +245,7 @@ export function useAppStore() {
             });
           } catch (err) {
             console.error('Health check failed:', err);
-            setSidecarStatus(prev => ({ ...prev, running: true }));
+            setSidecarStatus(prev => ({ ...prev, running: false }));
           }
         }, 4000);
       } else {
@@ -334,42 +276,36 @@ export function useAppStore() {
         return;
       }
 
+      // SSE just keeps the connection alive and signals completion
+      // Real-time progress comes through WebSocket now
       const es = new EventSource(`http://127.0.0.1:8188/models/download/${modelId}/progress`);
       activeEventSources[modelId] = es;
 
       es.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          setModels(prev => prev.map(m => {
-            if (m.id === modelId) {
-              return {
+          if (!data.downloading || data.downloaded) {
+            es.close();
+            delete activeEventSources[modelId];
+            // Final state sync
+            setModels(prev => prev.map(m =>
+              m.id === modelId ? {
                 ...m,
                 downloading: data.downloading,
                 downloaded: data.downloaded,
                 downloadProgress: data.progress,
-              };
-            }
-            return m;
-          }));
-
-          if (!data.downloading || data.downloaded) {
-            es.close();
-            delete activeEventSources[modelId];
+              } : m
+            ));
           }
         } catch (e) {
-          console.error('Error parsing SSE download message:', e);
+          console.error('Error parsing SSE message:', e);
         }
       };
 
-      es.onerror = (err) => {
-        console.error('SSE download error:', err);
+      es.onerror = () => {
         es.close();
         delete activeEventSources[modelId];
-        setModels(prev => prev.map(m =>
-          m.id === modelId ? { ...m, downloading: false, downloadProgress: 0 } : m
-        ));
       };
-
     } catch (err) {
       console.error('Error initiating download:', err);
       setModels(prev => prev.map(m =>
@@ -383,15 +319,11 @@ export function useAppStore() {
       activeEventSources[modelId].close();
       delete activeEventSources[modelId];
     }
-    
     setModels(prev => prev.map(m =>
       m.id === modelId ? { ...m, downloading: false, downloadProgress: 0 } : m
     ));
-
     try {
-      await fetch(`http://127.0.0.1:8188/models/${modelId}`, {
-        method: 'DELETE',
-      });
+      await fetch(`http://127.0.0.1:8188/models/${modelId}`, { method: 'DELETE' });
     } catch (err) {
       console.error('Failed to cancel download on backend:', err);
     }
@@ -401,11 +333,8 @@ export function useAppStore() {
     setModels(prev => prev.map(m =>
       m.id === modelId ? { ...m, downloaded: false, downloadProgress: 0 } : m
     ));
-
     try {
-      await fetch(`http://127.0.0.1:8188/models/${modelId}`, {
-        method: 'DELETE',
-      });
+      await fetch(`http://127.0.0.1:8188/models/${modelId}`, { method: 'DELETE' });
     } catch (err) {
       console.error('Failed to delete model on backend:', err);
     }
@@ -415,32 +344,30 @@ export function useAppStore() {
     try {
       const res = await fetch('http://127.0.0.1:8188/generate', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           prompt,
           negative_prompt: negPrompt,
           model_id: modelId,
         }),
       });
-
       const data = await res.json();
-      const jobId = data.job_id;
-      const thumbnailIndex = Math.floor(Math.random() * SAMPLE_THUMBNAILS.length);
+
+      if (data.status === 'error') {
+        console.error('Generation error:', data.message);
+        return;
+      }
 
       const newJob: GenerationJob = {
-        id: jobId,
+        id: data.job_id,
         prompt,
         negativePrompt: negPrompt,
         model: modelId,
         status: 'queued',
         progress: 0,
-        eta: 10,
+        eta: 0,
         startTime: Date.now(),
-        thumbnailUrl: SAMPLE_THUMBNAILS[thumbnailIndex],
       };
-
       setJobs(prev => [newJob, ...prev]);
     } catch (err) {
       console.error('Failed to start generation:', err);
@@ -451,13 +378,10 @@ export function useAppStore() {
     try {
       const res = await fetch('http://127.0.0.1:8188/license/validate', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ key }),
       });
       const data = await res.json();
-      
       setLicense({
         key,
         valid: data.valid,

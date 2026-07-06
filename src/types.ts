@@ -22,6 +22,8 @@ export interface ModelInfo {
   downloaded: boolean;
   downloadProgress: number;
   downloading: boolean;
+  speedMbps?: number;
+  etaSeconds?: number;
 }
 
 export type GenerationStatus = 'idle' | 'queued' | 'loading_model' | 'generating' | 'done' | 'error';

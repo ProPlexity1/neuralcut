@@ -133,6 +133,7 @@ fn start_sidecar(
             match Command::new(&python)
                 .arg(&script)
                 .env("SIDECAR_PORT", "8188")
+                .env("HF_TOKEN", std::env::var("HF_TOKEN").unwrap_or_else(|_| "".into()))
                 .spawn()
             {
                 Ok(child) => {
