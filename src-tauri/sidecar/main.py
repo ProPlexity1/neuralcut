@@ -1,17 +1,37 @@
 import sys
+# Force UTF-8 on stdout/stderr so Windows CP1252 never crashes on Unicode worker output
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import os
 import subprocess
 import asyncio
 import uuid
 import json
 import threading
+import queue
 from pathlib import Path
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from model_registry import (
+    MODEL_CONFIG, SHARED_RESOURCES, VMR_METADATA,
+    get_model, clamp_settings, resolve_offload_strategy, 
+    get_download_manifest, check_downloaded
+)
 import uvicorn
 import requests
+import logging
+
+class SuppressNoisyEndpoints(logging.Filter):
+    NOISY_PATHS = ("/gpu/stats", "/gpu ", "GET /models ")
+    def filter(self, record):
+        msg = record.getMessage()
+        return not any(p in msg for p in self.NOISY_PATHS)
+
+logging.getLogger("uvicorn.access").addFilter(SuppressNoisyEndpoints())
 
 app = FastAPI()
 
@@ -23,6 +43,10 @@ app.add_middleware(
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
+import tempfile
+
+SIDECAR_BUILD = "ltx-shared-095-queue-2026-07-29"
+SIDECAR_SCRIPT = str(Path(__file__).resolve())
 
 MODELS_DIR = Path(os.environ.get("MODELS_DIR", Path.home() / "AppData/Local/NeuralCut/models"))
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -30,48 +54,23 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", Path.home() / "Videos/NeuralCut"))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-MODEL_CONFIG = {
-    "ltx-video-lite": {
-        "repo_id": "Lightricks/LTX-Video",
-        "files": ["ltx-video-2b-v0.9.1.safetensors"],
-        "size_gb": 5.72,
-    },
-    "ltx-video-standard": {
-        "repo_id": "Lightricks/LTX-Video",
-        "files": ["ltx-video-2b-v0.9.5.safetensors"],
-        "size_gb": 6.34,
-    },
-    "ltx-video-pro": {
-        "repo_id": "Lightricks/LTX-Video",
-        "files": ["ltxv-13b-0.9.7-dev-fp8.safetensors"],
-        "size_gb": 15.7,
-    },
-    "ltx-video-ultra": {
-        "repo_id": "Lightricks/LTX-Video",
-        "files": ["ltxv-13b-0.9.8-distilled-fp8.safetensors"],
-        "size_gb": 16.0,
-    },
-}
-
 # ── Global State ──────────────────────────────────────────────────────────────
 
-def check_downloaded(model_id: str) -> bool:
-    config = MODEL_CONFIG.get(model_id)
-    if not config:
-        return False
-    model_dir = MODELS_DIR / model_id
-    return all((model_dir / f).exists() for f in config["files"])
+def init_models_db():
+    """Initialize download tracking for all models in VMR."""
+    db = {}
+    for model_id in MODEL_CONFIG:
+        downloaded = check_downloaded(model_id, MODELS_DIR)
+        db[model_id] = {
+            "downloaded": downloaded,
+            "downloading": False,
+            "progress": 100.0 if downloaded else 0.0,
+            "speed_mbps": 0.0,
+            "eta_seconds": 0,
+        }
+    return db
 
-models_db = {
-    model_id: {
-        "downloaded": check_downloaded(model_id),
-        "downloading": False,
-        "progress": 100.0 if check_downloaded(model_id) else 0.0,
-        "speed_mbps": 0.0,
-        "eta_seconds": 0,
-    }
-    for model_id in MODEL_CONFIG
-}
+models_db = init_models_db()
 
 active_connections = []
 cancel_flags: dict[str, bool] = {}
@@ -83,8 +82,12 @@ class GenerateRequest(BaseModel):
     prompt: str
     negative_prompt: str = ""
     model_id: str = "ltx-video-standard"
-    steps: int = 25
-    cfg_scale: float = 7.5
+    steps: int = 30
+    cfg_scale: float = 4.0
+    width: int = 704
+    height: int = 480
+    num_frames: int = 81
+    fps: int = 24
 
 class GenerateResponse(BaseModel):
     job_id: str
@@ -158,46 +161,106 @@ def real_model_download(model_id: str, loop=None):
         import time
         from huggingface_hub import hf_hub_url
 
-        config = MODEL_CONFIG[model_id]
-        model_dir = MODELS_DIR / model_id
-        model_dir.mkdir(parents=True, exist_ok=True)
-
-        files = config["files"]
-        total_files = len(files)
         cancel_flags[model_id] = False
-        total_bytes = config.get("size_gb", 2.0) * 1024 * 1024 * 1024
 
-        for file_idx, filename in enumerate(files):
+        # Get manifest: all files this model needs (including shared_resources if any)
+        manifest = get_download_manifest(model_id)
+
+        # Check what is already completed vs. what needs downloading
+        queue = []
+        completed_bytes = 0
+        total_model_bytes = 0
+
+        for entry in manifest:
+            if cancel_flags.get(model_id):
+                return
+            
+            local_path = MODELS_DIR / entry["local_path"]
+            if local_path.exists():
+                size = local_path.stat().st_size
+                completed_bytes += size
+                total_model_bytes += size
+            else:
+                queue.append(entry)
+                # Fetch remote size with allow_redirects=True
+                url = hf_hub_url(entry["repo_id"], entry["filename"])
+                try:
+                    r = requests.head(url, allow_redirects=True, timeout=10)
+                    size = int(r.headers.get("content-length", 0))
+                except Exception:
+                    size = 0
+                total_model_bytes += size
+
+        # Fallback if total_model_bytes is 0
+        if total_model_bytes == 0:
+            model = get_model(model_id)
+            total_model_bytes = int(model["distribution"]["estimated_download_size_gb"] * 1024 * 1024 * 1024)
+
+        if not queue:
+            # Already completed
+            models_db[model_id]["downloading"] = False
+            models_db[model_id]["downloaded"] = True
+            models_db[model_id]["progress"] = 100.0
+            models_db[model_id]["speed_mbps"] = 0.0
+            models_db[model_id]["eta_seconds"] = 0
+            broadcast_from_thread({
+                "type": "download_progress",
+                "model_id": model_id,
+                "progress": 100.0,
+                "speed_mbps": 0.0,
+                "eta_seconds": 0,
+                "downloading": False,
+                "downloaded": True,
+            })
+            return
+
+        # Get initial downloaded bytes of temp files in queue
+        initial_temp_bytes = 0
+        for entry in queue:
+            local_path = MODELS_DIR / entry["local_path"]
+            temp_path = Path(str(local_path) + ".tmp")
+            if temp_path.exists():
+                initial_temp_bytes += temp_path.stat().st_size
+
+        downloaded_so_far = completed_bytes + initial_temp_bytes
+        last_time = time.time()
+        last_bytes = downloaded_so_far
+
+        for file_idx, entry in enumerate(queue):
             if cancel_flags.get(model_id):
                 models_db[model_id]["downloading"] = False
                 models_db[model_id]["progress"] = 0.0
                 return
 
-            dest_path = model_dir / filename
-            if dest_path.exists():
-                models_db[model_id]["progress"] = ((file_idx + 1) / total_files) * 100.0
-                continue
+            repo_id = entry["repo_id"]
+            filename = entry["filename"]
+            local_path = MODELS_DIR / entry["local_path"]
+            
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = Path(str(local_path) + ".tmp")
+            file_initial_size = temp_path.stat().st_size if temp_path.exists() else 0
 
-            print(f"[NeuralCut] Downloading {filename}", flush=True)
-
-            dest_path_temp = model_dir / f"{filename}.tmp"
-            initial_size = dest_path_temp.stat().st_size if dest_path_temp.exists() else 0
+            url = hf_hub_url(repo_id, filename)
+            hf_token = os.environ.get("HF_TOKEN", "")
+            headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
+            if file_initial_size > 0:
+                headers["Range"] = f"bytes={file_initial_size}-"
 
             try:
-                url = hf_hub_url(repo_id=config["repo_id"], filename=filename)
-                hf_token = os.environ.get("HF_TOKEN", "")
-                headers = {"Authorization": f"Bearer {hf_token}"} if hf_token else {}
-                if initial_size > 0:
-                    headers["Range"] = f"bytes={initial_size}-"
-
                 response = requests.get(url, headers=headers, stream=True, timeout=60)
+                # If range request isn't supported or returns 416, delete temp and start fresh
+                if response.status_code == 416 or (file_initial_size > 0 and response.status_code != 206):
+                    if temp_path.exists():
+                        temp_path.unlink()
+                    file_initial_size = 0
+                    if "Range" in headers:
+                        del headers["Range"]
+                    response = requests.get(url, headers=headers, stream=True, timeout=60)
+                
                 response.raise_for_status()
 
-                downloaded = initial_size
-                last_time = time.time()
-                last_bytes = initial_size
-
-                with open(dest_path_temp, "ab") as f:
+                file_downloaded = file_initial_size
+                with open(temp_path, "ab" if file_initial_size > 0 else "wb") as f:
                     for chunk in response.iter_content(chunk_size=512 * 1024):
                         if cancel_flags.get(model_id):
                             models_db[model_id]["downloading"] = False
@@ -215,17 +278,19 @@ def real_model_download(model_id: str, loop=None):
 
                         if chunk:
                             f.write(chunk)
-                            downloaded += len(chunk)
+                            file_downloaded += len(chunk)
+                            downloaded_so_far += len(chunk)
 
                             now = time.time()
                             elapsed = now - last_time
-                            if elapsed >= 0.3:
-                                bytes_delta = downloaded - last_bytes
+                            if elapsed >= 0.5:
+                                bytes_delta = downloaded_so_far - last_bytes
                                 speed_bps = bytes_delta / elapsed if elapsed > 0 else 0
                                 speed_mbps = speed_bps / (1024 * 1024)
-                                file_progress = min(downloaded / total_bytes, 1.0)
-                                overall = ((file_idx + file_progress) / total_files) * 100.0
-                                eta = int((total_bytes - downloaded) / speed_bps) if speed_bps > 0 else 0
+                                
+                                overall = min((downloaded_so_far / total_model_bytes) * 100.0, 99.9)
+                                remaining_bytes = max(total_model_bytes - downloaded_so_far, 0)
+                                eta = int(remaining_bytes / speed_bps) if speed_bps > 0 else 0
 
                                 models_db[model_id]["progress"] = round(overall, 1)
                                 models_db[model_id]["speed_mbps"] = round(speed_mbps, 1)
@@ -242,13 +307,13 @@ def real_model_download(model_id: str, loop=None):
                                 })
 
                                 last_time = now
-                                last_bytes = downloaded
+                                last_bytes = downloaded_so_far
 
-                dest_path_temp.rename(dest_path)
-                print(f"[NeuralCut] {filename} done", flush=True)
+                temp_path.rename(local_path)
+                print(f"[NeuralCut] Downloaded file: {filename}", flush=True)
 
             except Exception as e:
-                print(f"[NeuralCut] Download error: {e}", flush=True)
+                print(f"[NeuralCut] Download error on file {filename}: {e}", flush=True)
                 models_db[model_id]["downloading"] = False
                 models_db[model_id]["progress"] = 0.0
                 broadcast_from_thread({
@@ -262,7 +327,7 @@ def real_model_download(model_id: str, loop=None):
                 })
                 return
 
-        # All files done
+        # Complete!
         models_db[model_id]["downloading"] = False
         models_db[model_id]["downloaded"] = True
         models_db[model_id]["progress"] = 100.0
@@ -285,73 +350,121 @@ def real_model_download(model_id: str, loop=None):
         models_db[model_id]["downloading"] = False
         models_db[model_id]["progress"] = 0.0
 
-# ── Generation (simulated — real inference next) ──────────────────────────────
+# ── Generation ──────────────────────────────
+active_processes: dict[str, subprocess.Popen] = {}
+generation_queue: "queue.Queue[tuple[str, GenerateRequest]]" = queue.Queue()
+generation_queue_worker_started = False
 
-async def run_generation(job_id: str, model_id: str, prompt: str, negative_prompt: str):
-    import asyncio
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _generate_sync, job_id, model_id, prompt, negative_prompt)
+def generation_queue_worker():
+    while True:
+        job_id, req = generation_queue.get()
+        try:
+            run_generation_subprocess(job_id, req)
+        finally:
+            generation_queue.task_done()
 
-def _generate_sync(job_id: str, model_id: str, prompt: str, negative_prompt: str):
-    import torch
-    from diffusers import LTXPipeline
-    from diffusers.utils import export_to_video
+def ensure_generation_queue_worker():
+    global generation_queue_worker_started
+    if generation_queue_worker_started:
+        return
+    generation_queue_worker_started = True
+    thread = threading.Thread(target=generation_queue_worker, daemon=True)
+    thread.start()
 
-    # Map model IDs to their diffusers repo
-    DIFFUSERS_REPOS = {
-        "ltx-video-lite": "Lightricks/LTX-Video-0.9.1",
-        "ltx-video-standard": "Lightricks/LTX-Video-0.9.5",
-        "ltx-video-pro": "Lightricks/LTX-Video",
-        "ltx-video-ultra": "Lightricks/LTX-Video",
+def run_generation_subprocess(job_id: str, req: GenerateRequest):
+    params = {
+        "job_id": job_id,
+        "model_id": req.model_id,
+        "prompt": req.prompt,
+        "negative_prompt": req.negative_prompt,
+        "steps": req.steps,
+        "cfg_scale": req.cfg_scale,
+        "width": req.width,
+        "height": req.height,
+        "num_frames": req.num_frames,
+        "fps": req.fps,
     }
 
-    repo_id = DIFFUSERS_REPOS.get(model_id, "Lightricks/LTX-Video-0.9.1")
+    params_file = Path(tempfile.gettempdir()) / f"neuralcut_job_{job_id}.json"
+    with open(params_file, "w") as f:
+        json.dump(params, f)
 
-    broadcast_from_thread({"type": "job_status", "job_id": job_id, "status": "loading_model", "progress": 0.0, "eta": 30, "outputPath": None, "error": None})
+    worker_script = Path(__file__).parent / "generate_worker.py"
 
+    proc = subprocess.Popen(
+        [sys.executable, str(worker_script), str(params_file)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        env=dict(os.environ),
+    )
+    active_processes[job_id] = proc
+
+    stderr_lines = []
+
+    def drain_stderr():
+        for line in proc.stderr:
+            stderr_lines.append(line)
+            print(f"[worker:{job_id}] {line}", end="", flush=True)
+
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    saw_terminal_status = False
     try:
-        pipe = LTXPipeline.from_pretrained(
-            repo_id,
-            torch_dtype=torch.bfloat16,
-        )
-        pipe.enable_model_cpu_offload()
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                print(f"[worker:{job_id}] {line}", flush=True)
+                continue
+            if payload.get("status") in ("done", "error"):
+                saw_terminal_status = True
+            broadcast_from_thread(payload)
+    finally:
+        proc.wait()
+        stderr_thread.join(timeout=2)
+        active_processes.pop(job_id, None)
+        params_file.unlink(missing_ok=True)
 
-        broadcast_from_thread({"type": "job_status", "job_id": job_id, "status": "generating", "progress": 10.0, "eta": 60, "outputPath": None, "error": None})
-
-        def step_callback(pipe, step, timestep, kwargs):
-            progress = 10 + (step / 25) * 85
-            broadcast_from_thread({"type": "job_status", "job_id": job_id, "status": "generating", "progress": round(progress, 1), "eta": int((25 - step) * 2), "outputPath": None, "error": None})
-            return kwargs
-
-        video = pipe(
-            prompt=prompt,
-            negative_prompt=negative_prompt or "worst quality, blurry, low resolution",
-            num_frames=25,
-            width=512,
-            height=320,
-            num_inference_steps=25,
-            guidance_scale=3.0,
-            callback_on_step_end=step_callback,
-        ).frames[0]
-
-        output_path = OUTPUT_DIR / f"video_{job_id}.mp4"
-        export_to_video(video, str(output_path), fps=8)
-
-        broadcast_from_thread({"type": "job_status", "job_id": job_id, "status": "done", "progress": 100.0, "eta": 0, "outputPath": str(output_path), "error": None})
-        print(f"[NeuralCut] Generation done: {output_path}", flush=True)
-
-    except Exception as e:
-        print(f"[NeuralCut] Generation error: {e}", flush=True)
-        broadcast_from_thread({"type": "job_status", "job_id": job_id, "status": "error", "progress": 0.0, "eta": 0, "outputPath": None, "error": str(e)})
-
-        
+    # Worker process died without ever sending a done/error message —
+    # this is the "silent crash" case (OOM kill, CUDA/driver abort, segfault).
+    if not saw_terminal_status:
+        tail = "".join(stderr_lines[-20:]).strip()
+        msg = f"Generation process terminated unexpectedly (exit code {proc.returncode})."
+        if proc.returncode is not None and proc.returncode < 0:
+            msg += " This usually means the OS killed it for using too much memory."
+        if tail:
+            msg += f" Last output: {tail[-500:]}"
+        broadcast_from_thread({
+            "type": "job_status", "job_id": job_id, "status": "error",
+            "progress": 0.0, "eta": 0, "outputPath": None, "error": msg,
+        })
+        print(f"[NeuralCut] Job {job_id} crashed silently, exit code {proc.returncode}", flush=True)
 # ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.get("/models/config")
+def get_models_config():
+    """Serve the full VMR to the frontend. Frontend uses this to build UI,
+    sliders, model chooser, etc."""
+    return {
+        "metadata": VMR_METADATA,
+        "models": MODEL_CONFIG,
+    }
 
 @app.get("/health", response_model=StatusResponse)
 def health():
     return {
         "running": True,
         "version": "1.0.0",
+        "build": SIDECAR_BUILD,
+        "script": SIDECAR_SCRIPT,
         "comfyui_ready": True,
         "python_version": sys.version,
     }
@@ -469,22 +582,45 @@ def delete_model(model_id: str):
     return {"status": "success", "message": f"Model {model_id} deleted"}
 
 @app.post("/generate", response_model=GenerateResponse)
-def generate(req: GenerateRequest, background_tasks: BackgroundTasks):
+def generate(req: GenerateRequest):
+    # Check model exists and is downloaded
+    if req.model_id not in MODEL_CONFIG:
+        return GenerateResponse(job_id="", status="error", message=f"Unknown model: {req.model_id}")
+    
     model = models_db.get(req.model_id, {})
     if not model.get("downloaded"):
-        return GenerateResponse(
-            job_id="",
-            status="error",
-            message=f"Model {req.model_id} is not downloaded yet",
-        )
+        return GenerateResponse(job_id="", status="error", message=f"Model {req.model_id} is not downloaded yet")
+
+    # Clamp all generation settings to the model's actual allowed range
+    clamped = clamp_settings(req.model_id, {
+        "steps": req.steps,
+        "cfg_scale": req.cfg_scale,
+        "width": req.width,
+        "height": req.height,
+        "num_frames": req.num_frames,
+        "fps": req.fps,
+    })
+
+    # Update request with clamped values
+    req.steps = clamped["steps"]
+    req.cfg_scale = clamped["cfg_scale"]
+    req.width = clamped["width"]
+    req.height = clamped["height"]
+    req.num_frames = clamped["num_frames"]
+    req.fps = clamped["fps"]
 
     job_id = str(uuid.uuid4())[:8]
-    background_tasks.add_task(run_generation, job_id, req.model_id, req.prompt, req.negative_prompt)
-    return GenerateResponse(
-        job_id=job_id,
-        status="queued",
-        message=f"Job {job_id} queued",
-    )
+    ensure_generation_queue_worker()
+    generation_queue.put((job_id, req))
+    return GenerateResponse(job_id=job_id, status="queued", message=f"Job {job_id} queued")
+
+@app.post("/generate/{job_id}/cancel")
+def cancel_generation(job_id: str):
+    proc = active_processes.get(job_id)
+    if not proc:
+        return {"status": "error", "message": "Job not found or already finished"}
+    proc.terminate()
+    return {"status": "success", "message": f"Cancel requested for {job_id}"}
 
 @app.post("/license/validate")
 def validate_license(req: LicenseRequest):
@@ -519,12 +655,15 @@ async def startup_event():
         print(f"[NeuralCut] No HF_TOKEN set — downloads may be slower", flush=True)
 
     print(f"[NeuralCut] Event loop captured", flush=True)
+    print(f"[NeuralCut] Sidecar build: {SIDECAR_BUILD}", flush=True)
+    print(f"[NeuralCut] Sidecar script: {SIDECAR_SCRIPT}", flush=True)
+    print(f"[NeuralCut] VMR loaded: {len(MODEL_CONFIG)} models", flush=True)
+    print(f"[NeuralCut] Models dir: {MODELS_DIR}", flush=True)
+    print(f"[NeuralCut] Output dir: {OUTPUT_DIR}", flush=True)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     port = int(os.environ.get("SIDECAR_PORT", 8188))
     print(f"[NeuralCut Sidecar] Starting on port {port}", flush=True)
-    print(f"[NeuralCut] Models dir: {MODELS_DIR}", flush=True)
-    print(f"[NeuralCut] Output dir: {OUTPUT_DIR}", flush=True)
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info", access_log=False)

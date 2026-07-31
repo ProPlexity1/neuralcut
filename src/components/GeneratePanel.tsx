@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Wand2, ChevronDown, Clock, Loader2, CheckCircle2,
@@ -7,9 +7,10 @@ import {
 } from 'lucide-react';
 import type { GenerationJob, ModelInfo, GenerationStatus } from '../types';
 import { cn } from '../utils/cn';
+import { convertFileSrc } from '@tauri-apps/api/core';
 
 interface GeneratePanelProps {
-  currentPrompt: string;
+  prompt: string;
   negativePrompt: string;
   selectedModel: string;
   models: ModelInfo[];
@@ -17,8 +18,8 @@ interface GeneratePanelProps {
   galleryItems: GenerationJob[];
   onPromptChange: (p: string) => void;
   onNegativePromptChange: (p: string) => void;
-  onModelChange: (m: string) => void;
-  onGenerate: (prompt: string, negPrompt: string, model: string) => void;
+  onSelectModel: (m: string) => void;
+  onGenerate: (prompt: string, negPrompt: string, model: string, settings: Record<string, number>) => void;
 }
 
 const STATUS_CONFIG: Record<GenerationStatus, { label: string; color: string; icon: React.ReactNode }> = {
@@ -40,7 +41,7 @@ const PROMPT_SUGGESTIONS = [
 ];
 
 export default function GeneratePanel({
-  currentPrompt,
+  prompt,
   negativePrompt,
   selectedModel,
   models,
@@ -48,20 +49,41 @@ export default function GeneratePanel({
   galleryItems,
   onPromptChange,
   onNegativePromptChange,
-  onModelChange,
+  onSelectModel,
   onGenerate,
 }: GeneratePanelProps) {
-  const [showAdvanced, setShowAdvanced] = useState(false);
   const [showModelDropdown, setShowModelDropdown] = useState(false);
   const [selectedGalleryItem, setSelectedGalleryItem] = useState<GenerationJob | null>(null);
+  const [durations, setDurations] = useState<Record<string, number>>({});
+  const [values, setValues] = useState<Record<string, number>>({});
 
   const activeModel = models.find(m => m.id === selectedModel);
   const activeJobs = jobs.filter(j => j.status !== 'done' && j.status !== 'error' && j.status !== 'idle');
-  const canGenerate = currentPrompt.trim().length > 0 && activeModel?.downloaded;
+  const canGenerate = prompt.trim().length > 0 && activeModel?.downloaded;
+
+  // Reset sliders to this model's own defaults whenever the selected model changes
+  useEffect(() => {
+    if (activeModel?.generation_limits) {
+      const defaults: Record<string, number> = {};
+      for (const [key, spec] of Object.entries(activeModel.generation_limits)) {
+        defaults[key] = spec.default;
+      }
+      setValues(defaults);
+    }
+  }, [selectedModel, activeModel]);
+
+  const handleLoadedMetadata = (jobId: string, e: React.SyntheticEvent<HTMLVideoElement>) => {
+    const dur = e.currentTarget.duration;
+    if (dur && isFinite(dur)) {
+      setDurations(prev => (prev[jobId] !== undefined ? prev : { ...prev, [jobId]: dur }));
+    }
+  };
 
   const handleGenerate = () => {
     if (canGenerate) {
-      onGenerate(currentPrompt, negativePrompt, selectedModel);
+      const submittedPrompt = prompt;
+      onGenerate(submittedPrompt, negativePrompt, selectedModel, values);
+      onPromptChange('');
     }
   };
 
@@ -69,14 +91,13 @@ export default function GeneratePanel({
     <div className="flex h-full flex-1 overflow-hidden">
       {/* Left: Prompt & Controls */}
       <div className="flex w-[420px] flex-col border-r border-border-dim flex-shrink-0">
-        {/* Prompt Input */}
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
           <div>
             <label className="mb-1.5 block text-xs font-medium text-text-muted uppercase tracking-wider">
               Prompt
             </label>
             <textarea
-              value={currentPrompt}
+              value={prompt}
               onChange={(e) => onPromptChange(e.target.value)}
               placeholder="Describe the video you want to generate..."
               rows={4}
@@ -122,88 +143,66 @@ export default function GeneratePanel({
                     exit={{ opacity: 0, y: -5 }}
                     className="absolute top-full left-0 right-0 z-20 mt-1 rounded-xl bg-bg-secondary border border-border-dim shadow-xl overflow-hidden"
                   >
-                    {models.map(model => (
-                      <button
-                        key={model.id}
-                        onClick={() => { onModelChange(model.id); setShowModelDropdown(false); }}
-                        className={cn(
-                          'flex w-full items-center justify-between px-4 py-3 text-sm hover:bg-bg-hover transition-colors',
-                          model.id === selectedModel ? 'bg-accent-purple/10' : ''
-                        )}
-                      >
-                        <div className="flex items-center gap-2">
-                          <TierBadge tier={model.tier} />
-                          <div className="text-left">
-                            <span className="text-text-primary">{model.name}</span>
-                            <div className="text-xs text-text-muted">{model.resolution} · {model.fps}fps · {model.duration}</div>
-                          </div>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          {model.downloaded ? (
-                            <span className="text-xs text-accent-green">Ready</span>
-                          ) : (
-                            <span className="text-xs text-text-muted">{model.size}GB</span>
+                    {models.filter(model => model.downloaded).length === 0 ? (
+                      <div className="px-4 py-3 text-xs text-text-muted text-center">
+                        No downloaded models. Go to Model Manager to download a model.
+                      </div>
+                    ) : (
+                      models.filter(model => model.downloaded).map(model => (
+                        <button
+                          key={model.id}
+                          onClick={() => { onSelectModel(model.id); setShowModelDropdown(false); }}
+                          className={cn(
+                            'flex w-full items-center justify-between px-4 py-3 text-sm hover:bg-bg-hover transition-colors',
+                            model.id === selectedModel ? 'bg-accent-purple/10' : ''
                           )}
-                        </div>
-                      </button>
-                    ))}
+                        >
+                          <div className="flex items-center gap-2">
+                            <TierBadge tier={model.tier} />
+                            <div className="text-left">
+                              <span className="text-text-primary">{model.name}</span>
+                              <div className="text-xs text-text-muted">{model.resolution} · {model.fps}fps · {model.duration}</div>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs text-accent-green">Ready</span>
+                          </div>
+                        </button>
+                      ))
+                    )}
                   </motion.div>
                 )}
               </AnimatePresence>
             </div>
           </div>
 
-          {/* Advanced Options */}
-          <div>
-            <button
-              onClick={() => setShowAdvanced(!showAdvanced)}
-              className="flex items-center gap-1.5 text-xs text-text-muted hover:text-text-secondary transition-colors"
-            >
-              <ChevronDown className={cn('h-3 w-3 transition-transform', showAdvanced && 'rotate-180')} />
-              Advanced Options
-            </button>
-            <AnimatePresence>
-              {showAdvanced && (
-                <motion.div
-                  initial={{ height: 0, opacity: 0 }}
-                  animate={{ height: 'auto', opacity: 1 }}
-                  exit={{ height: 0, opacity: 0 }}
-                  className="overflow-hidden"
-                >
-                  <div className="mt-3 space-y-3">
-                    <div>
-                      <label className="mb-1 block text-xs text-text-muted">Negative Prompt</label>
-                      <textarea
-                        value={negativePrompt}
-                        onChange={(e) => onNegativePromptChange(e.target.value)}
-                        placeholder="What to avoid..."
-                        rows={2}
-                        className="w-full rounded-lg bg-bg-tertiary border border-border-dim px-3 py-2 text-xs text-text-primary placeholder-text-muted focus:border-accent-purple focus:outline-none resize-none"
-                      />
-                    </div>
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <label className="mb-1 block text-xs text-text-muted">Steps</label>
-                        <input type="number" defaultValue={30} min={10} max={100} className="w-full rounded-lg bg-bg-tertiary border border-border-dim px-3 py-2 text-xs text-text-primary focus:border-accent-purple focus:outline-none" />
-                      </div>
-                      <div>
-                        <label className="mb-1 block text-xs text-text-muted">CFG Scale</label>
-                        <input type="number" defaultValue={7.5} min={1} max={20} step={0.5} className="w-full rounded-lg bg-bg-tertiary border border-border-dim px-3 py-2 text-xs text-text-primary focus:border-accent-purple focus:outline-none" />
-                      </div>
-                      <div>
-                        <label className="mb-1 block text-xs text-text-muted">Seed</label>
-                        <input type="number" defaultValue={-1} className="w-full rounded-lg bg-bg-tertiary border border-border-dim px-3 py-2 text-xs text-text-primary focus:border-accent-purple focus:outline-none" />
-                      </div>
-                      <div>
-                        <label className="mb-1 block text-xs text-text-muted">Frames</label>
-                        <input type="number" defaultValue={81} min={9} max={257} step={8} className="w-full rounded-lg bg-bg-tertiary border border-border-dim px-3 py-2 text-xs text-text-primary focus:border-accent-purple focus:outline-none" />
-                      </div>
-                    </div>
+          {/* Advanced Options — driven entirely by this model's settings schema */}
+          {activeModel?.generation_limits && (
+            <div>
+              <label className="mb-2 block text-xs font-medium text-text-muted uppercase tracking-wider">
+                Advanced Options
+              </label>
+              <div className="space-y-3">
+                {Object.entries(activeModel.generation_limits).map(([key, spec]) => (
+                  <div key={key}>
+                    <label className="mb-1 flex justify-between text-xs text-text-muted">
+                      <span className="capitalize">{key.replace(/_/g, ' ')}</span>
+                      <span className="text-text-secondary">{values[key] ?? spec.default}</span>
+                    </label>
+                    <input
+                      type="range"
+                      min={spec.min}
+                      max={spec.max}
+                      step={spec.step}
+                      value={values[key] ?? spec.default}
+                      onChange={(e) => setValues(v => ({ ...v, [key]: Number(e.target.value) }))}
+                      className="w-full accent-accent-purple"
+                    />
                   </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
-          </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* Active Jobs */}
           {activeJobs.length > 0 && (
@@ -301,30 +300,28 @@ export default function GeneratePanel({
                   onClick={() => setSelectedGalleryItem(item)}
                 >
                   <div className="aspect-video relative">
-                    {item.thumbnailUrl ? (
-                      <img
-                        src={item.thumbnailUrl}
-                        alt={item.prompt}
+                    {item.outputPath && (
+                      <video
+                        src={convertFileSrc(item.outputPath)}
                         className="h-full w-full object-cover"
+                        muted
+                        preload="metadata"
+                        onLoadedMetadata={(e) => handleLoadedMetadata(item.id, e)}
                       />
-                    ) : (
-                      <div className="h-full w-full bg-gradient-to-br from-accent-purple/20 to-accent-blue/20 flex items-center justify-center">
-                        <Film className="h-8 w-8 text-text-muted/30" />
-                      </div>
                     )}
-                    {/* Play overlay */}
                     <div className="absolute inset-0 bg-black/0 group-hover:bg-black/40 flex items-center justify-center transition-colors">
                       <Play className="h-8 w-8 text-white opacity-0 group-hover:opacity-100 transition-opacity" />
                     </div>
-                    {/* Duration badge */}
-                    <div className="absolute bottom-1.5 right-1.5 rounded bg-black/70 px-1.5 py-0.5 text-xs text-white">
-                      0:{String(3 + Math.floor(Math.random() * 7)).padStart(2, '0')}
-                    </div>
+                    {durations[item.id] !== undefined && (
+                      <div className="absolute bottom-1.5 right-1.5 rounded bg-black/70 px-1.5 py-0.5 text-xs text-white">
+                        {Math.floor(durations[item.id] / 60)}:{String(Math.floor(durations[item.id] % 60)).padStart(2, '0')}
+                      </div>
+                    )}
                   </div>
                   <div className="p-2.5">
                     <p className="text-xs text-text-secondary line-clamp-2 leading-relaxed">{item.prompt}</p>
                     <div className="mt-1.5 flex items-center justify-between">
-                      <TierBadge tier={models.find(m => m.id === item.model)?.tier || 'standard'} />
+                      <TierBadge tier={models.find(m => m.id === item.model_id)?.tier || 'standard'} />
                       <span className="text-xs text-text-muted">
                         {new Date(item.endTime || item.startTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                       </span>
@@ -354,7 +351,6 @@ export default function GeneratePanel({
               className="relative max-w-4xl w-full mx-4 rounded-2xl bg-bg-secondary border border-border-dim overflow-hidden"
               onClick={(e) => e.stopPropagation()}
             >
-              {/* Header */}
               <div className="flex items-center justify-between border-b border-border-dim px-4 py-3">
                 <span className="text-sm font-medium text-text-primary">Video Preview</span>
                 <div className="flex items-center gap-1">
@@ -378,21 +374,18 @@ export default function GeneratePanel({
                   </button>
                 </div>
               </div>
-              {/* Image */}
-              <div className="aspect-video bg-black">
-                {selectedGalleryItem.thumbnailUrl && (
-                  <img
-                    src={selectedGalleryItem.thumbnailUrl}
-                    alt={selectedGalleryItem.prompt}
-                    className="h-full w-full object-contain"
-                  />
-                )}
-              </div>
-              {/* Info */}
+              {selectedGalleryItem.outputPath && (
+                <video
+                  src={convertFileSrc(selectedGalleryItem.outputPath)}
+                  className="h-full w-full object-contain"
+                  controls
+                  autoPlay
+                />
+              )}
               <div className="border-t border-border-dim p-4">
                 <p className="text-sm text-text-primary mb-2">{selectedGalleryItem.prompt}</p>
                 <div className="flex items-center gap-3 text-xs text-text-muted">
-                  <span>Model: {models.find(m => m.id === selectedGalleryItem.model)?.name}</span>
+                  <span>Model: {models.find(m => m.id === selectedGalleryItem.model_id)?.name}</span>
                   <span>•</span>
                   <span>{selectedGalleryItem.outputPath}</span>
                 </div>

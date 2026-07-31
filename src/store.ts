@@ -1,72 +1,105 @@
 import { useState, useCallback, useEffect } from 'react';
-import type { GPUInfo, ModelInfo, GenerationJob, AppView, SidecarStatus, LicenseInfo, GenerationStatus } from './types';
+import type {
+  GPUInfo,
+  ModelInfo,
+  GenerationJob,
+  AppView,
+  SidecarStatus,
+  LicenseInfo,
+  GenerationStatus,
+  VMRRegistry,
+  VMRModelEntry,
+} from './types';
 import { invoke } from '@tauri-apps/api/core';
-
-export const MODELS: ModelInfo[] = [
-  {
-    id: 'ltx-video-lite',
-    name: 'LTX-Video 0.9.1',
-    tier: 'lite',
-    size: 5.72,
-    minVram: 6,
-    resolution: '512×320',
-    fps: 8,
-    duration: '2-4s',
-    huggingFaceRepo: 'Lightricks/LTX-Video',
-    description: 'Lightweight model for quick previews. Runs on most GPUs with 6GB+ VRAM.',
-    downloaded: false,
-    downloadProgress: 0,
-    downloading: false,
-  },
-  {
-    id: 'ltx-video-standard',
-    name: 'LTX-Video 0.9.5',
-    tier: 'standard',
-    size: 6.34,
-    minVram: 8,
-    resolution: '768×512',
-    fps: 16,
-    duration: '3-5s',
-    huggingFaceRepo: 'Lightricks/LTX-Video',
-    description: 'Standard quality text-to-video generation with good detail and motion.',
-    downloaded: false,
-    downloadProgress: 0,
-    downloading: false,
-  },
-  {
-    id: 'ltx-video-pro',
-    name: 'LTX-Video 13B FP8',
-    tier: 'pro',
-    size: 15.7,
-    minVram: 12,
-    resolution: '1024×576',
-    fps: 24,
-    duration: '4-8s',
-    huggingFaceRepo: 'Lightricks/LTX-Video',
-    description: 'High-quality 13B parameter model in FP8 precision. Requires 12GB+ VRAM.',
-    downloaded: false,
-    downloadProgress: 0,
-    downloading: false,
-  },
-  {
-    id: 'ltx-video-ultra',
-    name: 'LTX-Video 13B Full',
-    tier: 'ultra',
-    size: 28.6,
-    minVram: 16,
-    resolution: '1280×720',
-    fps: 30,
-    duration: '5-10s',
-    huggingFaceRepo: 'Lightricks/LTX-Video',
-    description: 'Maximum quality full precision 13B model. Requires 16GB+ VRAM.',
-    downloaded: false,
-    downloadProgress: 0,
-    downloading: false,
-  },
-];
 
 let activeWs: WebSocket | null = null;
 const activeEventSources: Record<string, EventSource> = {};
+
+/**
+ * Transform a VMRModelEntry into a ModelInfo (the shape the UI works with).
+ * This extracts the relevant fields and derives UI-friendly values.
+ */
+function transformVMRToModelInfo(id: string, vmr: VMRModelEntry): ModelInfo {
+  const gen = vmr.generation;
+  const widthDefault = gen.defaults['width'] || 512;
+  const heightDefault = gen.defaults['height'] || 512;
+  const fpsDefault = gen.defaults['fps'] || 24;
+  const numFramesDefault = gen.defaults['num_frames'] || 49;
+
+  // Derive resolution string from defaults
+  const resolution = `${widthDefault}×${heightDefault}`;
+
+  // Derive duration range from frame limits and fps
+  const frameLimits = gen.limits['num_frames'];
+  const fpsLimits = gen.limits['fps'];
+  let duration = 'Variable';
+  if (frameLimits && fpsLimits) {
+    const minSecs = (frameLimits.min / fpsLimits.default).toFixed(1);
+    const maxSecs = (frameLimits.max / fpsLimits.default).toFixed(1);
+    duration = `${minSecs}-${maxSecs}s`;
+  }
+
+  return {
+    // Identity
+    id,
+    display_name: vmr.identity.display_name,
+    family: vmr.identity.family,
+    variant: vmr.identity.variant,
+
+    // Legacy/alias fields for UI compatibility
+    name: vmr.identity.display_name,
+    minVram: vmr.hardware.minimum_vram_gb,
+    size: vmr.distribution.estimated_download_size_gb,
+    resolution,
+    fps: fpsDefault,
+    duration,
+    huggingFaceRepo: vmr.distribution.repo,
+
+    // UI presentation
+    tier: vmr.ui.tier,
+    description: vmr.ui.description,
+    pros: vmr.ui.pros,
+    cons: vmr.ui.cons,
+    tags: vmr.ui.tags,
+    accent_color: vmr.ui.accent_color,
+
+    // Distribution
+    size_gb: vmr.distribution.estimated_download_size_gb,
+    repo: vmr.distribution.repo,
+
+    // Hardware requirements
+    minimum_vram_gb: vmr.hardware.minimum_vram_gb,
+    recommended_vram_gb: vmr.hardware.recommended_vram_gb,
+    recommended_ram_gb: vmr.hardware.recommended_ram_gb,
+
+    // Capabilities
+    capabilities: vmr.capabilities,
+
+    // Generation settings for sliders
+    generation_defaults: gen.defaults,
+    generation_limits: gen.limits,
+
+    // Download state (populated later from /models endpoint)
+    downloaded: false,
+    downloading: false,
+    progress: 0,
+    downloadProgress: 0,
+    speed_mbps: 0,
+    speedMbps: 0,
+    eta_seconds: 0,
+    etaSeconds: 0,
+  };
+}
+
+/**
+ * Fetch VMR from backend and transform into ModelInfo array.
+ */
+async function fetchVMRModels(): Promise<ModelInfo[]> {
+  const res = await fetch('http://127.0.0.1:8188/models/config');
+  const data: { metadata: any; models: Record<string, VMRModelEntry> } = await res.json();
+
+  return Object.entries(data.models).map(([id, vmr]) => transformVMRToModelInfo(id, vmr));
+}
 
 const connectWebSocket = (
   setJobs: React.Dispatch<React.SetStateAction<GenerationJob[]>>,
@@ -91,45 +124,55 @@ const connectWebSocket = (
     try {
       const msg = JSON.parse(event.data);
 
-      // Real-time download progress via WebSocket
       if (msg.type === 'download_progress') {
         const { model_id, progress, speed_mbps, eta_seconds, downloading, downloaded } = msg;
-        setModels(prev => prev.map(m =>
-          m.id === model_id ? {
-            ...m,
-            downloadProgress: progress,
-            speedMbps: speed_mbps,
-            etaSeconds: eta_seconds,
-            downloading,
-            downloaded,
-          } : m
-        ));
+        setModels((prev) =>
+          prev.map((m) =>
+            m.id === model_id
+              ? {
+                  ...m,
+                  progress,
+                  downloadProgress: progress,
+                  speed_mbps,
+                  speedMbps: speed_mbps,
+                  eta_seconds,
+                  etaSeconds: eta_seconds,
+                  downloading,
+                  downloaded,
+                }
+              : m
+          )
+        );
       }
 
-      // Generation job status updates
       if (msg.type === 'job_status') {
         const { job_id, status, progress, eta, outputPath, error } = msg;
-        setJobs(prev => prev.map(j => {
-          if (j.id === job_id) {
-            const updatedJob = {
-              ...j,
-              status: status as GenerationStatus,
-              progress,
-              eta,
-              outputPath: outputPath || undefined,
-              error: error || undefined,
-              endTime: status === 'done' || status === 'error' ? Date.now() : j.endTime,
-            };
-            if (status === 'done' && j.status !== 'done') {
-              setGalleryItems(gal => {
-                if (gal.some(g => g.id === job_id)) return gal;
-                return [updatedJob, ...gal];
-              });
+        setJobs((prev) =>
+          prev.map((j) => {
+            if (j.id === job_id) {
+              const updatedJob = {
+                ...j,
+                status: status as GenerationStatus,
+                progress,
+                eta,
+                outputPath: outputPath || undefined,
+                error: error || undefined,
+                endTime:
+                  status === 'done' || status === 'error'
+                    ? Date.now()
+                    : j.endTime,
+              };
+              if (status === 'done' && j.status !== 'done') {
+                setGalleryItems((gal) => {
+                  if (gal.some((g) => g.id === job_id)) return gal;
+                  return [updatedJob, ...gal];
+                });
+              }
+              return updatedJob;
             }
-            return updatedJob;
-          }
-          return j;
-        }));
+            return j;
+          })
+        );
       }
     } catch (e) {
       console.error('[NeuralCut] Error parsing WebSocket message:', e);
@@ -152,16 +195,17 @@ export function useAppStore() {
   const [view, setView] = useState<AppView>('setup');
   const [setupStep, setSetupStep] = useState(0);
   const [gpu, setGpu] = useState<GPUInfo | null>(null);
-  const [models, setModels] = useState<ModelInfo[]>(MODELS);
+  const [models, setModels] = useState<ModelInfo[]>([]);
   const [jobs, setJobs] = useState<GenerationJob[]>([]);
   const [currentPrompt, setCurrentPrompt] = useState('');
   const [negativePrompt, setNegativePrompt] = useState('');
-  const [selectedModel, setSelectedModel] = useState('ltx-video-lite');
+  const [selectedModel, setSelectedModel] = useState('');
   const [sidecarStatus, setSidecarStatus] = useState<SidecarStatus>({
     running: false,
     port: 8188,
-    comfyuiReady: false,
+    comfyui_ready: false,
     version: '1.0.0',
+    python_version: '',
   });
   const [license, setLicense] = useState<LicenseInfo>({
     key: '',
@@ -181,44 +225,67 @@ export function useAppStore() {
       console.error('GPU detection failed:', err);
       setGpu({
         name: 'No NVIDIA GPU detected',
-        vram: 0,
+        vram_mb: 0,
+        vram_gb: 0,
         driver: 'N/A',
-        cudaVersion: 'N/A',
+        temperature: 0,
         detected: false,
       });
       setSetupStep(2);
     }
   }, []);
 
+  /**
+   * Fetch the VMR from the backend and build the model list from it,
+   * then layer live download status on top.
+   */
   const fetchModels = useCallback(async () => {
     try {
-      const res = await fetch('http://127.0.0.1:8188/models');
-      const backendModels = await res.json();
-      setModels(prev => prev.map(m => {
+      // Fetch VMR and transform to ModelInfo
+      const baseModels = await fetchVMRModels();
+
+      // Fetch live download status from backend
+      const statusRes = await fetch('http://127.0.0.1:8188/models');
+      const backendModels = await statusRes.json();
+
+      // Merge: VMR data + download state
+      const merged = baseModels.map((m) => {
         const backendModel = backendModels[m.id];
         if (backendModel) {
           return {
             ...m,
             downloaded: backendModel.downloaded,
             downloading: backendModel.downloading,
+            progress: backendModel.progress,
             downloadProgress: backendModel.progress,
+            speed_mbps: backendModel.speed_mbps ?? 0,
             speedMbps: backendModel.speed_mbps ?? 0,
+            eta_seconds: backendModel.eta_seconds ?? 0,
             etaSeconds: backendModel.eta_seconds ?? 0,
           };
         }
         return m;
-      }));
+      });
+
+      setModels(merged);
+
+      // Default the selected model to the first downloaded one, or first one if none are downloaded
+      setSelectedModel((prev) => {
+        if (prev) return prev;
+        const firstDownloaded = merged.find((m) => m.downloaded);
+        return firstDownloaded?.id || merged[0]?.id || '';
+      });
     } catch (err) {
-      console.error('Failed to fetch models from sidecar:', err);
+      console.error('Failed to fetch VMR from sidecar:', err);
     }
   }, []);
 
   useEffect(() => {
-    if (sidecarStatus.running && sidecarStatus.comfyuiReady) {
+    if (sidecarStatus.running && sidecarStatus.comfyui_ready) {
       fetchModels();
       connectWebSocket(setJobs, setGalleryItems, setModels);
     }
-  }, [sidecarStatus.running, sidecarStatus.comfyuiReady, fetchModels]);
+  }, [sidecarStatus.running, sidecarStatus.comfyui_ready, fetchModels]);
 
   const startSidecar = useCallback(async () => {
     try {
@@ -240,12 +307,13 @@ export function useAppStore() {
             setSidecarStatus({
               running: true,
               port: 8188,
-              comfyuiReady: data.comfyui_ready,
+              comfyui_ready: data.comfyui_ready,
               version: data.version,
+              python_version: data.python_version,
             });
           } catch (err) {
             console.error('Health check failed:', err);
-            setSidecarStatus(prev => ({ ...prev, running: false }));
+            setSidecarStatus((prev) => ({ ...prev, running: false }));
           }
         }, 4000);
       } else {
@@ -259,26 +327,35 @@ export function useAppStore() {
   const downloadModel = useCallback(async (modelId: string) => {
     if (activeEventSources[modelId]) return;
 
-    setModels(prev => prev.map(m =>
-      m.id === modelId ? { ...m, downloading: true, downloadProgress: 0 } : m
-    ));
+    setModels((prev) =>
+      prev.map((m) =>
+        m.id === modelId
+          ? { ...m, downloading: true, progress: 0 }
+          : m
+      )
+    );
 
     try {
-      const startRes = await fetch(`http://127.0.0.1:8188/models/download/${modelId}`, {
-        method: 'POST',
-      });
+      const startRes = await fetch(
+        `http://127.0.0.1:8188/models/download/${modelId}`,
+        { method: 'POST' }
+      );
       const startData = await startRes.json();
       if (startData.status === 'error') {
         console.error('Failed to start model download:', startData.message);
-        setModels(prev => prev.map(m =>
-          m.id === modelId ? { ...m, downloading: false, downloadProgress: 0 } : m
-        ));
+        setModels((prev) =>
+          prev.map((m) =>
+            m.id === modelId
+              ? { ...m, downloading: false, progress: 0 }
+              : m
+          )
+        );
         return;
       }
 
-      // SSE just keeps the connection alive and signals completion
-      // Real-time progress comes through WebSocket now
-      const es = new EventSource(`http://127.0.0.1:8188/models/download/${modelId}/progress`);
+      const es = new EventSource(
+        `http://127.0.0.1:8188/models/download/${modelId}/progress`
+      );
       activeEventSources[modelId] = es;
 
       es.onmessage = (event) => {
@@ -287,15 +364,19 @@ export function useAppStore() {
           if (!data.downloading || data.downloaded) {
             es.close();
             delete activeEventSources[modelId];
-            // Final state sync
-            setModels(prev => prev.map(m =>
-              m.id === modelId ? {
-                ...m,
-                downloading: data.downloading,
-                downloaded: data.downloaded,
-                downloadProgress: data.progress,
-              } : m
-            ));
+            setModels((prev) =>
+              prev.map((m) =>
+                m.id === modelId
+                  ? {
+                      ...m,
+                      downloading: data.downloading,
+                      downloaded: data.downloaded,
+                      progress: data.progress,
+                      downloadProgress: data.progress,
+                    }
+                  : m
+              )
+            );
           }
         } catch (e) {
           console.error('Error parsing SSE message:', e);
@@ -308,9 +389,13 @@ export function useAppStore() {
       };
     } catch (err) {
       console.error('Error initiating download:', err);
-      setModels(prev => prev.map(m =>
-        m.id === modelId ? { ...m, downloading: false, downloadProgress: 0 } : m
-      ));
+      setModels((prev) =>
+        prev.map((m) =>
+          m.id === modelId
+            ? { ...m, downloading: false, progress: 0 }
+            : m
+        )
+      );
     }
   }, []);
 
@@ -319,60 +404,82 @@ export function useAppStore() {
       activeEventSources[modelId].close();
       delete activeEventSources[modelId];
     }
-    setModels(prev => prev.map(m =>
-      m.id === modelId ? { ...m, downloading: false, downloadProgress: 0 } : m
-    ));
+    setModels((prev) =>
+      prev.map((m) =>
+        m.id === modelId ? { ...m, downloading: false, progress: 0 } : m
+      )
+    );
     try {
-      await fetch(`http://127.0.0.1:8188/models/${modelId}`, { method: 'DELETE' });
+      await fetch(`http://127.0.0.1:8188/models/${modelId}`, {
+        method: 'DELETE',
+      });
     } catch (err) {
       console.error('Failed to cancel download on backend:', err);
     }
   }, []);
 
   const deleteModel = useCallback(async (modelId: string) => {
-    setModels(prev => prev.map(m =>
-      m.id === modelId ? { ...m, downloaded: false, downloadProgress: 0 } : m
-    ));
+    setModels((prev) =>
+      prev.map((m) =>
+        m.id === modelId ? { ...m, downloaded: false, progress: 0 } : m
+      )
+    );
     try {
-      await fetch(`http://127.0.0.1:8188/models/${modelId}`, { method: 'DELETE' });
+      await fetch(`http://127.0.0.1:8188/models/${modelId}`, {
+        method: 'DELETE',
+      });
     } catch (err) {
       console.error('Failed to delete model on backend:', err);
     }
   }, []);
 
-  const startGeneration = useCallback(async (prompt: string, negPrompt: string, modelId: string) => {
-    try {
-      const res = await fetch('http://127.0.0.1:8188/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+  /**
+   * Start a generation job.
+   * Takes slider values from the UI, sends them to the backend.
+   * Backend re-validates every setting against VMR limits via clamp_settings().
+   */
+  const startGeneration = useCallback(
+    async (
+      prompt: string,
+      negPrompt: string,
+      modelId: string,
+      settings: Record<string, number>
+    ) => {
+      try {
+        const res = await fetch('http://127.0.0.1:8188/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            prompt,
+            negative_prompt: negPrompt,
+            model_id: modelId,
+            ...settings,
+          }),
+        });
+        const data = await res.json();
+
+        if (data.status === 'error') {
+          console.error('Generation error:', data.message);
+          return;
+        }
+
+        const newJob: GenerationJob = {
+          id: data.job_id,
           prompt,
           negative_prompt: negPrompt,
           model_id: modelId,
-        }),
-      });
-      const data = await res.json();
-
-      if (data.status === 'error') {
-        console.error('Generation error:', data.message);
-        return;
+          status: 'queued',
+          progress: 0,
+          eta: 0,
+          startTime: Date.now(),
+        };
+        setJobs((prev) => [newJob, ...prev]);
+      } catch (err) {
+        console.error('Failed to start generation:', err);
       }
-
-      const newJob: GenerationJob = {
-        id: data.job_id,
-        prompt,
-        negativePrompt: negPrompt,
-        model: modelId,
-        status: 'queued',
-        progress: 0,
-        eta: 0,
-        startTime: Date.now(),
-      };
-      setJobs(prev => [newJob, ...prev]);
-    } catch (err) {
-      console.error('Failed to start generation:', err);
-    }
-  }, []);
+    },
+    []
+  );
 
   const validateLicense = useCallback(async (key: string) => {
     try {
@@ -386,7 +493,7 @@ export function useAppStore() {
         key,
         valid: data.valid,
         tier: data.tier,
-        expiresAt: data.expires_at,
+        expires_at: data.expires_at,
         features: data.features,
       });
     } catch (err) {
@@ -401,17 +508,28 @@ export function useAppStore() {
   }, []);
 
   return {
-    view, setView,
-    setupStep, setSetupStep,
-    gpu, setGpu,
-    models, setModels,
-    jobs, setJobs,
-    currentPrompt, setCurrentPrompt,
-    negativePrompt, setNegativePrompt,
-    selectedModel, setSelectedModel,
-    sidecarStatus, setSidecarStatus,
-    license, setLicense,
-    galleryItems, setGalleryItems,
+    view,
+    setView,
+    setupStep,
+    setSetupStep,
+    gpu,
+    setGpu,
+    models,
+    setModels,
+    jobs,
+    setJobs,
+    currentPrompt,
+    setCurrentPrompt,
+    negativePrompt,
+    setNegativePrompt,
+    selectedModel,
+    setSelectedModel,
+    sidecarStatus,
+    setSidecarStatus,
+    license,
+    setLicense,
+    galleryItems,
+    setGalleryItems,
     detectGPU,
     startSidecar,
     downloadModel,

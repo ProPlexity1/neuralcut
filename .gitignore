@@ -3,3 +3,8 @@ src-tauri/target/
 src-tauri/sidecar/venv/
 dist/
 .env
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/

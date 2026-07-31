@@ -1,0 +1,12 @@
+Starting script...
+Imports done, loading transformer...
+E:\Ukasha Data\NeuralCut\src-tauri\sidecar\venv\Lib\site-packages\huggingface_hub\utils\_validators.py:205: UserWarning: The `local_dir_use_symlinks` argument is deprecated and ignored in `hf_hub_download`. Downloading to a local directory does not use symlinks anymore.
+  warnings.warn(
+There are modules in LTXVideoTransformer3DModel that should be kept in float32: []. Casting directly with `to()` can lead to inconsistent results; set `torch_dtype` in `from_pretrained()` instead to keep these modules in float32.
+Transformer loaded, loading pipeline...
+Fetching 24 files:   0%|          | 0/24 [00:00<?, ?it/s]forrtl: error (200): program aborting due to window-CLOSE event
+Image              PC                Routine            Line        Source             
+KERNELBASE.dll     00007FFA47C33ECD  Unknown               Unknown  Unknown
+KERNEL32.DLL       00007FFA48A4E957  Unknown               Unknown  Unknown
+ntdll.dll          00007FFA4A287C1C  Unknown               Unknown  Unknown
+^C

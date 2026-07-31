@@ -23,7 +23,6 @@ export default function App() {
     j => j.status !== 'done' && j.status !== 'error' && j.status !== 'idle'
   ).length;
 
-  // Setup screen
   if (store.view === 'setup') {
     return (
       <div className="h-screen w-screen overflow-hidden bg-bg-primary">
@@ -37,15 +36,11 @@ export default function App() {
     );
   }
 
-  // Main app layout
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-bg-primary">
-      {/* Titlebar */}
       <Titlebar sidecar={store.sidecarStatus} />
 
-      {/* Main Content */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Sidebar */}
         <Sidebar
           activeView={store.view}
           onViewChange={store.setView}
@@ -53,7 +48,6 @@ export default function App() {
           activeJobCount={activeJobCount}
         />
 
-        {/* Content Area */}
         <AnimatePresence mode="wait">
           <motion.div
             key={store.view}
@@ -65,7 +59,7 @@ export default function App() {
           >
             {store.view === 'main' && (
               <GeneratePanel
-                currentPrompt={store.currentPrompt}
+                prompt={store.currentPrompt}
                 negativePrompt={store.negativePrompt}
                 selectedModel={store.selectedModel}
                 models={store.models}
@@ -73,7 +67,7 @@ export default function App() {
                 galleryItems={store.galleryItems}
                 onPromptChange={store.setCurrentPrompt}
                 onNegativePromptChange={store.setNegativePrompt}
-                onModelChange={store.setSelectedModel}
+                onSelectModel={store.setSelectedModel}
                 onGenerate={store.startGeneration}
               />
             )}

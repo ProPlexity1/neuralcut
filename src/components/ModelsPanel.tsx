@@ -1,7 +1,7 @@
 import { motion } from 'framer-motion';
 import {
   Download, Trash2, CheckCircle2, HardDrive, ExternalLink,
-  Pause, Clock, Zap
+  Pause, Clock, Zap, AlertCircle
 } from 'lucide-react';
 import type { ModelInfo, GPUInfo } from '../types';
 import { cn } from '../utils/cn';
@@ -147,12 +147,37 @@ export default function ModelsPanel({ models, gpu, onDownload, onCancel, onDelet
                             </span>
                           )}
                           {!compatible && gpu && (
-                            <span className="text-xs text-accent-amber">
+                            <span className="text-xs text-accent-amber flex items-center gap-1">
+                              <AlertCircle className="h-3 w-3" />
                               Requires {model.minVram}GB+ VRAM
                             </span>
                           )}
                         </div>
                         <p className="mt-1 text-xs text-text-secondary max-w-lg">{model.description}</p>
+                        
+                        {/* Hardware Alert Banner */}
+                        {!compatible && gpu && (
+                          <div className="mt-3 flex items-start gap-2 rounded-xl bg-accent-amber/5 border border-accent-amber/20 p-3 text-[11px] text-accent-amber max-w-lg">
+                            <AlertCircle className="h-4 w-4 flex-shrink-0 mt-0.5" />
+                            <div>
+                              <span className="font-semibold select-none">Hardware Alert:</span>
+                              <span className="ml-1">
+                                This model requires {model.minVram}GB VRAM, but your GPU ({gpu.name}) only has {gpu.vram}GB. Running this model may be very slow or fail. CPU offloading will be enabled to help.
+                              </span>
+                            </div>
+                          </div>
+                        )}
+                        {!gpu?.detected && (
+                          <div className="mt-3 flex items-start gap-2 rounded-xl bg-accent-red/5 border border-accent-red/20 p-3 text-[11px] text-accent-red max-w-lg">
+                            <AlertCircle className="h-4 w-4 flex-shrink-0 mt-0.5" />
+                            <div>
+                              <span className="font-semibold select-none">Hardware Alert:</span>
+                              <span className="ml-1">
+                                No compatible NVIDIA GPU detected. Running video generation on CPU is extremely slow and not recommended.
+                              </span>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     </div>
 
@@ -177,10 +202,10 @@ export default function ModelsPanel({ models, gpu, onDownload, onCancel, onDelet
                         <button
                           onClick={() => onDownload(model.id)}
                           className={cn(
-                            'flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors',
+                            'flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors border',
                             compatible
-                              ? `bg-gradient-to-r ${colors.gradient} text-white shadow-sm hover:shadow-md`
-                              : 'bg-bg-tertiary text-text-muted border border-border-dim'
+                              ? `bg-gradient-to-r ${colors.gradient} text-white border-transparent shadow-sm hover:shadow-md`
+                              : 'bg-accent-amber/15 text-accent-amber border-accent-amber/30 hover:bg-accent-amber/25 shadow-sm'
                           )}
                         >
                           <Download className="h-3.5 w-3.5" />

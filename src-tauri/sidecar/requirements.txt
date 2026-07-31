@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+websockets
+requests
+huggingface_hub
+diffusers
+transformers
+accelerate
+sentencepiece
+protobuf
+imageio
+imageio-ffmpeg
